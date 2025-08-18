@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  # FastAPI Backend
+  eva-api:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: eva-api
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - POSTGRES_URL=postgresql://eva:${POSTGRES_PASSWORD}@postgres:5432/eva_db
+    volumes:
+      - ./backend:/app
+      - ./data/models:/app/models
+      - ./data/audio_cache:/app/audio_cache
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - chromadb
+      - postgres
+    networks:
+      - eva-network
+
+  # Redis for hot cache and rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: eva-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - eva-network
+
+  # ChromaDB for vector memory
+  chromadb:
+    image: chromadb/chroma:0.4.24
+    container_name: eva-chromadb
+    restart: unless-stopped
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+      - ANONYMIZED_TELEMETRY=False
+      - ALLOW_RESET=True
+    ports:
+      - "8001:8000"
+    networks:
+      - eva-network
+
+  # PostgreSQL for structured data
+  postgres:
+    image: postgres:15-alpine
+    container_name: eva-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=eva_db
+      - POSTGRES_USER=eva
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - eva-network
+
+  # Caddy reverse proxy with auto-TLS
+  caddy:
+    image: caddy:2-alpine
+    container_name: eva-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./configs/Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - eva-network
+    depends_on:
+      - eva-api
+
+  # vLLM server for local inference
+  vllm:
+    image: vllm/vllm-openai:v0.4.2
+    container_name: eva-vllm
+    restart: unless-stopped
+    volumes:
+      - ./data/models:/root/.cache/huggingface
+      - huggingface_cache:/root/.cache/huggingface
+    environment:
+      - MODEL=${VLLM_MODEL_NAME:-microsoft/DialoGPT-medium}
+      - SERVED_MODEL_NAME=eva-local
+      - HOST=0.0.0.0
+      - PORT=8000
+      - MAX_MODEL_LEN=4096
+      - TENSOR_PARALLEL_SIZE=1
+      - GPU_MEMORY_UTILIZATION=0.8
+      - DTYPE=half
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    ports:
+      - "8002:8000"
+    networks:
+      - eva-network
+    command: >
+      --model ${VLLM_MODEL_NAME:-microsoft/DialoGPT-medium}
+      --served-model-name eva-local
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 4096
+      --tensor-parallel-size 1
+      --gpu-memory-utilization 0.8
+      --trust-remote-code
+      --dtype=half
+    # GPU support enabled for production performance  
+    # Comment out GPU section if you get CUDA compatibility errors
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  redis_data:
+  chroma_data:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+  huggingface_cache:
+
+networks:
+  eva-network:
+    driver: bridge

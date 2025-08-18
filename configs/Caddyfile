@@ -1,0 +1,81 @@
+# Eva Telegram Bot - Caddy Configuration
+# Replace yourdomain.com with your actual domain
+
+{$DOMAIN:localhost} {
+    # Telegram webhook endpoint
+    handle /webhook* {
+        reverse_proxy eva-api:8000
+    }
+    
+    # Health check endpoint
+    handle /health* {
+        reverse_proxy eva-api:8000
+    }
+    
+    # Admin endpoints (protect these in production)
+    handle /admin* {
+        reverse_proxy eva-api:8000
+        # Add basic auth for admin endpoints
+        # basicauth {
+        #     admin $2a$14$hashed_password_here
+        # }
+    }
+    
+    # API endpoints
+    handle /api/* {
+        reverse_proxy eva-api:8000
+    }
+    
+    # Default response for root
+    handle / {
+        respond "Eva AI Assistant - Service Running" 200
+    }
+    
+    # Security headers
+    header {
+        # Remove server information
+        -Server
+        
+        # Security headers
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        
+        # HSTS (enable after SSL is working)
+        # Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    }
+    
+    # Logging
+    log {
+        output file /var/log/caddy/eva.log {
+            roll_size 100MB
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        format json
+        level INFO
+    }
+    
+    # Rate limiting (basic)
+    handle /webhook* {
+        rate_limit {
+            zone webhook {
+                key {remote_host}
+                events 60
+                window 1m
+            }
+        }
+    }
+}
+
+# Health check endpoint on port 8080 (for load balancers)
+:8080 {
+    handle /health {
+        reverse_proxy eva-api:8000
+    }
+    
+    handle / {
+        respond "OK" 200
+    }
+}
