@@ -1,0 +1,197 @@
+# Eva Lite Caddyfile - Production Reverse Proxy with Auto-TLS
+# Handles HTTPS certificates, load balancing, and security headers
+
+{
+    # Global settings
+    admin off
+    auto_https on
+    email admin@{$DOMAIN:localhost}
+    
+    # Security settings
+    servers {
+        metrics
+        timeouts {
+            read_timeout   30s
+            write_timeout  30s
+            idle_timeout   120s
+        }
+    }
+}
+
+# Main Eva Lite API endpoint
+{$DOMAIN:localhost} {
+    # Security headers
+    header {
+        # HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        
+        # Prevent XSS
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        
+        # CSP for security
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+        
+        # Hide server info
+        -Server
+        -X-Powered-By
+    }
+    
+    # Rate limiting
+    rate_limit {
+        zone webhook {
+            key {remote_host}
+            events 100
+            window 1m
+        }
+    }
+    
+    # Health check endpoint (public)
+    handle /health {
+        reverse_proxy eva-backend:8000 {
+            health_timeout 10s
+            health_interval 30s
+            health_status 200
+        }
+    }
+    
+    # Telegram webhook endpoint (main traffic)
+    handle /webhook {
+        reverse_proxy eva-backend:8000 {
+            # Load balancing for multiple instances
+            health_timeout 10s
+            health_interval 30s
+            health_status 200
+            
+            # Request headers
+            header_up Host {upstream_hostport}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            
+            # Timeouts for webhook processing
+            timeout 30s
+        }
+    }
+    
+    # API documentation (development/admin only)
+    handle /docs* {
+        # Basic auth for API docs in production
+        # basicauth {
+        #     admin $2a$14$example_hash_here
+        # }
+        reverse_proxy eva-backend:8000
+    }
+    
+    # Admin endpoints (protected)
+    handle /status /metrics /lora/* {
+        # IP whitelist for admin endpoints
+        @admin_ips {
+            remote_ip 10.0.0.0/8 192.168.0.0/16 172.16.0.0/12 127.0.0.1
+        }
+        
+        # Allow admin IPs or require auth
+        @admin_access {
+            expression {admin_ips} || {query.admin_key} == "{$ADMIN_KEY:}"
+        }
+        
+        handle @admin_access {
+            reverse_proxy eva-backend:8000
+        }
+        
+        # Deny other requests
+        handle {
+            respond "Access denied" 403
+        }
+    }
+    
+    # All other API requests
+    handle /* {
+        reverse_proxy eva-backend:8000 {
+            health_timeout 10s
+            health_interval 30s
+            health_status 200
+        }
+    }
+    
+    # Logging
+    log {
+        output file /var/log/caddy/eva-access.log {
+            roll_size 100mb
+            roll_keep 5
+        }
+        format json
+        level INFO
+    }
+    
+    # Error handling
+    handle_errors {
+        @5xx expression {http.error.status_code} >= 500
+        handle @5xx {
+            respond "Service temporarily unavailable" 503
+        }
+        
+        @4xx expression {http.error.status_code} >= 400 && {http.error.status_code} < 500
+        handle @4xx {
+            respond "Bad request" 400
+        }
+    }
+}
+
+# Monitoring endpoints (optional, for Prometheus)
+monitoring.{$DOMAIN:localhost} {
+    # Restrict to internal network
+    @internal_only {
+        remote_ip 172.20.0.0/16
+    }
+    
+    handle @internal_only {
+        # Prometheus metrics
+        handle /metrics/* {
+            reverse_proxy eva-prometheus:9090
+        }
+        
+        # vLLM metrics
+        handle /vllm/metrics/* {
+            reverse_proxy eva-vllm:8000
+        }
+        
+        # ChromaDB admin
+        handle /chromadb/* {
+            reverse_proxy eva-chromadb:8000
+        }
+    }
+    
+    # Deny external access
+    handle {
+        respond "Access denied" 403
+    }
+}
+
+# Development/staging subdomain (if needed)
+dev.{$DOMAIN:localhost} {
+    # Forward to development instance
+    reverse_proxy eva-backend:8000 {
+        header_up X-Environment "development"
+    }
+    
+    # Basic auth for dev environment
+    basicauth {
+        dev $2a$14$example_dev_hash_here
+    }
+}
+
+# Static file serving for assets (if needed)
+assets.{$DOMAIN:localhost} {
+    root * /var/www/assets
+    file_server
+    
+    # Cache static assets
+    header {
+        Cache-Control "public, max-age=31536000"
+    }
+    
+    # Gzip compression
+    encode gzip
+}

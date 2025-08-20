@@ -1,127 +1,213 @@
 version: '3.8'
 
+# Eva Lite - PRD Compliant Production Architecture
+# FastAPI + vLLM + ChromaDB + Redis + XTTS v2 + Caddy
+
 services:
-  # FastAPI Backend
-  eva-api:
+  # Eva Lite FastAPI Backend
+  eva-backend:
     build: 
       context: ./backend
       dockerfile: Dockerfile
-    container_name: eva-api
+    container_name: eva-backend
     restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379
+      # Core Configuration
+      - ENVIRONMENT=production
+      - HOST=0.0.0.0
+      - PORT=8000
+      
+      # Telegram Bot Configuration
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      
+      # vLLM Integration
+      - VLLM_URL=http://vllm:8000
+      - LOCAL_AI_URL=http://vllm:8000/v1
+      
+      # OpenAI Fallback (optional)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      
+      # Memory Services
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
-      - POSTGRES_URL=postgresql://eva:${POSTGRES_PASSWORD}@postgres:5432/eva_db
+      - REDIS_URL=redis://redis:6379/0
+      
+      # Voice Configuration (XTTS v2)
+      - XTTS_SERVER_URL=http://xtts:8020
+      - TTS_ENABLED=true
+      - VOICE_CACHE_ENABLED=true
+      
+      # Performance Settings
+      - MAX_TOKENS=1024
+      - TEMPERATURE=0.7
+      - EMBEDDING_MODEL=all-mpnet-base-v2
+      
+      # GPU Configuration
+      - CUDA_VISIBLE_DEVICES=0
     volumes:
-      - ./backend:/app
-      - ./data/models:/app/models
-      - ./data/audio_cache:/app/audio_cache
+      - ./data/audio:/app/data/audio
+      - ./data/models:/app/data/models
+      - ./logs:/app/logs
     ports:
       - "8000:8000"
     depends_on:
-      - redis
+      - vllm
       - chromadb
-      - postgres
+      - redis
     networks:
       - eva-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
-  # Redis for hot cache and rate limiting
+  # Redis Cache & Session Storage
   redis:
     image: redis:7-alpine
     container_name: eva-redis
     restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     volumes:
-      - redis_data:/data
+      - ./data/redis:/data
     ports:
       - "6379:6379"
     networks:
       - eva-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # ChromaDB for vector memory
+  # ChromaDB Vector Database
   chromadb:
-    image: chromadb/chroma:0.4.24
+    image: chromadb/chroma:latest
     container_name: eva-chromadb
     restart: unless-stopped
-    volumes:
-      - chroma_data:/chroma/chroma
     environment:
       - CHROMA_SERVER_HOST=0.0.0.0
       - CHROMA_SERVER_HTTP_PORT=8000
-      - ANONYMIZED_TELEMETRY=False
-      - ALLOW_RESET=True
-    ports:
-      - "8001:8000"
-    networks:
-      - eva-network
-
-  # PostgreSQL for structured data
-  postgres:
-    image: postgres:15-alpine
-    container_name: eva-postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_DB=eva_db
-      - POSTGRES_USER=eva
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - ANONYMIZED_TELEMETRY=false
+      - ALLOW_RESET=true
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    networks:
-      - eva-network
-
-  # Caddy reverse proxy with auto-TLS
-  caddy:
-    image: caddy:2-alpine
-    container_name: eva-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./configs/Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - eva-network
-    depends_on:
-      - eva-api
-
-  # vLLM server for local inference
-  vllm:
-    image: vllm/vllm-openai:v0.4.2
-    container_name: eva-vllm
-    restart: unless-stopped
-    volumes:
-      - ./data/models:/root/.cache/huggingface
-      - huggingface_cache:/root/.cache/huggingface
-    environment:
-      - MODEL=${VLLM_MODEL_NAME:-microsoft/DialoGPT-medium}
-      - SERVED_MODEL_NAME=eva-local
-      - HOST=0.0.0.0
-      - PORT=8000
-      - MAX_MODEL_LEN=4096
-      - TENSOR_PARALLEL_SIZE=1
-      - GPU_MEMORY_UTILIZATION=0.8
-      - DTYPE=half
-      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - ./data/chromadb:/chroma/chroma
     ports:
       - "8002:8000"
     networks:
       - eva-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Caddy Reverse Proxy with Auto-TLS
+  caddy:
+    image: caddy:2-alpine
+    container_name: eva-caddy
+    restart: unless-stopped
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - eva-backend
+    networks:
+      - eva-network
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # vLLM Inference Server with Llama-3 8B
+  vllm:
+    image: vllm/vllm-openai:v0.4.2
+    container_name: eva-vllm
+    restart: unless-stopped
+    command: [
+      "--model", "meta-llama/Meta-Llama-3-8B-Instruct",
+      "--served-model-name", "llama-3-8b",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--max-model-len", "4096",
+      "--tensor-parallel-size", "1",
+      "--dtype", "bfloat16",
+      "--api-key", "eva-lite-api-key",
+      "--enable-lora",
+      "--lora-modules", "eva-friendly=/app/adapters/eva-friendly",
+      "--lora-modules", "eva-formal=/app/adapters/eva-formal", 
+      "--lora-modules", "eva-genz=/app/adapters/eva-genz",
+      "--max-loras", "3",
+      "--max-cpu-loras", "3"
+    ]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - HF_HOME=/app/models/hf_cache
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    volumes:
+      - ./data/models/hf_cache:/app/models/hf_cache
+      - ./data/adapters:/app/adapters
+      - /dev/shm:/dev/shm
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - eva-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s
+
+  # XTTS v2 Text-to-Speech Server (Working Alternative)
+  xtts:
+    image: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
+    container_name: eva-xtts
+    restart: unless-stopped
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
     command: >
-      --model ${VLLM_MODEL_NAME:-microsoft/DialoGPT-medium}
-      --served-model-name eva-local
-      --host 0.0.0.0
-      --port 8000
-      --max-model-len 4096
-      --tensor-parallel-size 1
-      --gpu-memory-utilization 0.8
-      --trust-remote-code
-      --dtype=half
-    # GPU support enabled for production performance  
-    # Comment out GPU section if you get CUDA compatibility errors
+      bash -c "
+      pip install TTS[all] fastapi uvicorn[standard] && 
+      python -c 'from TTS.api import TTS; print(\"Installing XTTS v2...\"); TTS(\"tts_models/multilingual/multi-dataset/xtts_v2\", gpu=True)' &&
+      python -c '
+      from TTS.api import TTS
+      from fastapi import FastAPI
+      import uvicorn
+      app = FastAPI()
+      tts = TTS(\"tts_models/multilingual/multi-dataset/xtts_v2\", gpu=True)
+      @app.get(\"/health\")
+      def health(): return {\"status\": \"healthy\"}
+      @app.post(\"/tts_stream\")  
+      def generate_tts(request: dict):
+          audio = tts.tts(text=request[\"text\"], speaker_wav=None, language=\"en\")
+          return {\"audio\": audio.tolist()}
+      uvicorn.run(app, host=\"0.0.0.0\", port=8020)
+      '
+      "
+    ports:
+      - "8020:8020"
+    volumes:
+      - ./data/models/xtts:/root/.cache/tts
+    networks:
+      - eva-network
     deploy:
       resources:
         reservations:
@@ -130,14 +216,41 @@ services:
               count: 1
               capabilities: [gpu]
 
-volumes:
-  redis_data:
-  chroma_data:
-  postgres_data:
-  caddy_data:
-  caddy_config:
-  huggingface_cache:
+  # Monitoring & Metrics (Optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: eva-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - eva-network
+    profiles:
+      - monitoring
 
 networks:
   eva-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  chromadb_data:
+    driver: local
+  redis_data:
+    driver: local
+  models_cache:
+    driver: local
+  audio_data:
+    driver: local

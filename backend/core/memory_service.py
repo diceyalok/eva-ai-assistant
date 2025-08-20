@@ -67,7 +67,10 @@ class MemoryService:
             
         except Exception as e:
             logger.error(f"Failed to initialize MemoryService: {e}")
-            raise
+            logger.warning("⚠️ Memory service disabled - ChromaDB not available")
+            self._chroma_client = None
+            self._collection = None
+            # Don't raise - allow Eva to continue without memory
     
     async def store_memory(
         self,
@@ -81,6 +84,10 @@ class MemoryService:
         
         if not self._initialized:
             await self.initialize()
+            
+        if not self._collection:
+            logger.debug("Memory storage skipped - ChromaDB not available")
+            return False
         
         try:
             # Get cached embedding model (no reload!)
@@ -141,6 +148,10 @@ class MemoryService:
         
         if not self._initialized:
             await self.initialize()
+            
+        if not self._collection:
+            logger.debug("Memory search skipped - ChromaDB not available")
+            return []
         
         try:
             # Get cached embedding model (no reload!)

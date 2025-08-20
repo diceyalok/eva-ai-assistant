@@ -12,6 +12,21 @@ from datetime import datetime
 import redis.asyncio as aioredis
 from .model_manager import model_manager
 from .config_manager import config
+try:
+    from utils.performance_monitor import performance_monitor
+except ImportError:
+    # Fallback if performance monitor not available
+    from contextlib import asynccontextmanager
+    
+    class DummyPerformanceMonitor:
+        @asynccontextmanager
+        async def track_operation(self, operation, target_time):
+            yield {"operation": operation, "target": target_time}
+            
+        async def initialize(self):
+            pass
+    
+    performance_monitor = DummyPerformanceMonitor()
 
 # Optional imports with graceful degradation
 try:
@@ -44,12 +59,20 @@ class VoiceService:
         self.vad_threshold = 0.5
         self.min_speech_duration = 0.5  # seconds
         
-        # TTS settings based on tone
-        self.tts_speakers = {
-            "friendly": "speaker_01",
-            "formal": "speaker_02", 
-            "gen-z": "speaker_03"
+        # XTTS v2 settings for PRD compliance
+        self.xtts_url = "http://xtts:8020"  # Updated port per docker-compose
+        self.xtts_speakers = {
+            "friendly": "eva_friendly.wav",
+            "formal": "eva_formal.wav", 
+            "gen-z": "eva_genz.wav"
         }
+        
+        # XTTS v2 client
+        import httpx
+        self.xtts_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(max_connections=5)
+        )
     
     async def initialize(self):
         """Initialize voice service with cached models"""
@@ -86,63 +109,65 @@ class VoiceService:
         if not self._initialized:
             await self.initialize()
         
-        try:
-            # Get cached Whisper model (no reload!)
-            whisper_model = await model_manager.get_whisper_model(
-                config.voice.whisper_model_size
-            )
-            
-            # Process audio if needed
-            processed_path = file_path
-            if AUDIO_PROCESSING_AVAILABLE and apply_vad:
-                # Convert and clean audio
-                converted_path = await self._convert_audio(file_path)
-                if converted_path:
-                    # Apply Voice Activity Detection
-                    vad_path = await self._apply_vad(converted_path)
-                    processed_path = vad_path or converted_path
+        # Track voice processing performance (PRD target: ≤1.2s)
+        async with performance_monitor.track_operation("voice_processing", 1.2) as perf_data:
+                try:
+                    # Get cached Whisper model (no reload!)
+                    whisper_model = await model_manager.get_whisper_model(
+                        config.voice.whisper_model_size
+                    )
                     
-                    # Cleanup temp conversion file
-                    if converted_path != processed_path:
-                        await self._cleanup_temp_files([converted_path])
-            
-            # Transcribe using cached model
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, 
-                lambda: whisper_model.transcribe(processed_path)
-            )
-            
-            transcription = result.get("text", "").strip()
-            
-            # Cleanup processed file if it's different from original
-            if processed_path != file_path:
-                await self._cleanup_temp_files([processed_path])
-            
-            # Calculate audio duration
-            duration = await self._get_audio_duration(file_path) if AUDIO_PROCESSING_AVAILABLE else 0.0
-            
-            # Store processing stats
-            await self._update_voice_stats(user_id, "transcription", duration)
-            
-            logger.info(f"✅ Audio transcribed for user {user_id[:8]}... | {len(transcription)} chars")
-            
-            return {
-                "success": True,
-                "transcription": transcription,
-                "duration": duration,
-                "confidence": result.get("language_probability", 0.0),
-                "detected_language": result.get("language", "en"),
-                "processed_at": datetime.utcnow().isoformat()
-            }
-            
-        except Exception as e:
-            logger.error(f"Audio transcription failed: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "processed_at": datetime.utcnow().isoformat()
-            }
+                    # Process audio if needed
+                    processed_path = file_path
+                    if AUDIO_PROCESSING_AVAILABLE and apply_vad:
+                        # Convert and clean audio
+                        converted_path = await self._convert_audio(file_path)
+                        if converted_path:
+                            # Apply Voice Activity Detection
+                            vad_path = await self._apply_vad(converted_path)
+                            processed_path = vad_path or converted_path
+                            
+                            # Cleanup temp conversion file
+                            if converted_path != processed_path:
+                                await self._cleanup_temp_files([converted_path])
+                    
+                    # Transcribe using cached model
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None, 
+                        lambda: whisper_model.transcribe(processed_path)
+                    )
+                    
+                    transcription = result.get("text", "").strip()
+                    
+                    # Cleanup processed file if it's different from original
+                    if processed_path != file_path:
+                        await self._cleanup_temp_files([processed_path])
+                    
+                    # Calculate audio duration
+                    duration = await self._get_audio_duration(file_path) if AUDIO_PROCESSING_AVAILABLE else 0.0
+                    
+                    # Store processing stats
+                    await self._update_voice_stats(user_id, "transcription", duration)
+                    
+                    logger.info(f"✅ Audio transcribed for user {user_id[:8]}... | {len(transcription)} chars")
+                    
+                    return {
+                        "success": True,
+                        "transcription": transcription,
+                        "duration": duration,
+                        "confidence": result.get("language_probability", 0.0),
+                        "detected_language": result.get("language", "en"),
+                        "processed_at": datetime.utcnow().isoformat()
+                    }
+                    
+                except Exception as e:
+                    logger.error(f"Audio transcription failed: {e}")
+                    return {
+                        "success": False,
+                        "error": str(e),
+                        "processed_at": datetime.utcnow().isoformat()
+                    }
     
     async def generate_speech(
         self,
@@ -322,23 +347,21 @@ class VoiceService:
         return segments
     
     async def _generate_tts_audio(self, text: str, tone: str) -> Optional[str]:
-        """Generate TTS audio using best available method"""
+        """Generate TTS audio using XTTS v2"""
         try:
             temp_fd, temp_path = tempfile.mkstemp(suffix=".wav", prefix="eva_tts_")
             os.close(temp_fd)
             
-            # Try different TTS methods in order of preference
+            # Use XTTS v2 service (primary method per PRD)
+            audio_path = await self._generate_xtts_v2(text, tone, temp_path)
+            if audio_path:
+                return audio_path
+                
+            # Fallback to local methods if XTTS fails
             import platform
             system = platform.system().lower()
             
-            # Try XTTS server first (if configured)
-            xtts_server_url = os.getenv("XTTS_SERVER_URL")
-            if xtts_server_url:
-                audio_path = await self._generate_xtts_via_api(text, tone, temp_path, xtts_server_url)
-                if audio_path:
-                    return audio_path
-            
-            # Try Windows SAPI (fastest, zero setup)
+            # Try Windows SAPI as fallback
             if system == "windows":
                 audio_path = await self._generate_windows_sapi(text, temp_path)
                 if audio_path:
@@ -358,34 +381,44 @@ class VoiceService:
             logger.error(f"TTS generation error: {e}")
             return None
     
-    async def _generate_xtts_via_api(self, text: str, tone: str, output_path: str, server_url: str) -> Optional[str]:
-        """Generate TTS via XTTS server API"""
+    async def _generate_xtts_v2(self, text: str, tone: str, output_path: str) -> Optional[str]:
+        """Generate TTS via XTTS v2 service (PRD Compliant)"""
         try:
-            import httpx
-            
-            speaker = self.tts_speakers.get(tone, self.tts_speakers["friendly"])
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{server_url}/tts",
+            # Performance tracking for voice response (PRD target: ≤1.2s)
+            async with performance_monitor.track_operation("voice_response", 1.2) as perf_data:
+                
+                # Select speaker voice based on personality
+                speaker = self.xtts_speakers.get(tone, self.xtts_speakers["friendly"])
+                
+                # XTTS v2 API request with optimized settings for speed
+                response = await self.xtts_client.post(
+                    f"{self.xtts_url}/tts_stream",
                     json={
                         "text": text,
-                        "speaker_wav": f"/app/models/speakers/{speaker}.wav",
-                        "language": "en"
-                    }
+                        "speaker_wav": speaker,
+                        "language": "en",
+                        "stream_chunk_size": 20,  # Smaller chunks for lower latency
+                        "temperature": 0.7,  # Balanced quality vs speed
+                        "length_penalty": 1.0,
+                        "repetition_penalty": 1.1
+                    },
+                    timeout=15.0  # Aggressive timeout for speed
                 )
                 
                 if response.status_code == 200:
+                    # Stream audio data efficiently
                     with open(output_path, 'wb') as f:
-                        f.write(response.content)
-                    logger.debug(f"✅ XTTS API generated: {text[:50]}...")
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    logger.info(f"✅ XTTS v2 generated {len(text)} chars in {perf_data.get('duration', 0):.2f}s")
                     return output_path
                 else:
-                    logger.warning(f"XTTS API failed: {response.status_code}")
+                    logger.warning(f"XTTS v2 failed: {response.status_code} - {response.text}")
                     return None
                     
         except Exception as e:
-            logger.debug(f"XTTS API error: {e}")
+            logger.warning(f"XTTS v2 error (falling back): {e}")
             return None
     
     async def _generate_windows_sapi(self, text: str, output_path: str) -> Optional[str]:

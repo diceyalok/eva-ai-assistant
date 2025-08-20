@@ -8,6 +8,23 @@ import httpx
 from typing import Optional, Dict, Any, List
 from .model_manager import model_manager
 from .config_manager import config
+from .reasoning_service import reasoning_service
+from .lora_service import lora_service
+try:
+    from utils.performance_monitor import performance_monitor
+except ImportError:
+    # Fallback if performance monitor not available
+    from contextlib import asynccontextmanager
+    
+    class DummyPerformanceMonitor:
+        @asynccontextmanager
+        async def track_operation(self, operation, target_time):
+            yield {"operation": operation, "target": target_time}
+            
+        async def initialize(self):
+            pass
+    
+    performance_monitor = DummyPerformanceMonitor()
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +55,15 @@ class AIService:
         # Warm up models
         await model_manager.warm_up_models()
         
+        # Initialize reasoning service
+        await reasoning_service.initialize()
+        
+        # Initialize LoRA service for personality management
+        await lora_service.initialize()
+        
+        # Initialize performance monitoring
+        await performance_monitor.initialize()
+        
         self._initialized = True
         logger.info("🎯 AIService initialized successfully")
     
@@ -48,31 +74,88 @@ class AIService:
         context: Optional[List[Dict]] = None,
         tone: str = "friendly"
     ) -> Dict[str, Any]:
-        """Generate AI response with smart model selection"""
+        """Generate AI response with reasoning layer integration"""
         
         if not self._initialized:
             await self.initialize()
         
-        # Try local GPU first (fast and free)
-        local_response = await self._try_local_ai(message, context, tone)
-        if local_response["success"]:
-            logger.info(f"✅ Local AI response for user {user_id}")
-            return local_response
-        
-        # Fallback to OpenAI (slower but more reliable)
-        if self._openai_client:
-            openai_response = await self._try_openai(message, context, tone)
-            if openai_response["success"]:
-                logger.info(f"✅ OpenAI response for user {user_id}")
-                return openai_response
-        
-        # Final fallback
-        logger.warning(f"All AI services failed for user {user_id}")
-        return {
-            "success": False,
-            "response": "I'm having trouble processing your message right now. Please try again in a moment.",
-            "source": "fallback"
-        }
+        # Track overall text response performance (PRD target: ≤2.5s)
+        async with performance_monitor.track_operation("text_response", 2.5) as perf_data:
+            try:
+                # Step 1: Optimize for personality using LoRA adapters
+                lora_optimization = await lora_service.optimize_for_personality(
+                    personality=tone,
+                    context=context or []
+                )
+            
+                # Step 2: Analyze context using reasoning service
+                context_analysis = await reasoning_service.analyze_context(
+                    message=message,
+                    context=context or [],
+                    user_id=user_id
+                )
+                
+                # Step 3: Apply reasoning to generate response
+                reasoning_result = await reasoning_service.reason_and_respond(
+                    message=message,
+                    context_analysis=context_analysis,
+                    personality=tone
+                )
+                
+                # Step 4: Generate final response using selected AI backend
+                if reasoning_result.get("response"):
+                    # Try local GPU first (fast and free)
+                    local_response = await self._try_local_ai(
+                        reasoning_result["response"], context, tone
+                    )
+                    if local_response["success"]:
+                        logger.info(f"✅ Local AI + Reasoning for user {user_id}")
+                        return {
+                            **local_response,
+                            "reasoning_type": reasoning_result.get("reasoning_type"),
+                            "complexity": reasoning_result.get("complexity"),
+                            "lora_adapter": lora_optimization.get("adapter"),
+                            "personality_optimized": lora_optimization.get("success", False)
+                        }
+                    
+                    # Fallback to OpenAI (slower but more reliable)
+                    if self._openai_client:
+                        openai_response = await self._try_openai(
+                            reasoning_result["response"], context, tone
+                        )
+                        if openai_response["success"]:
+                            logger.info(f"✅ OpenAI + Reasoning for user {user_id}")
+                            return {
+                                **openai_response,
+                                "reasoning_type": reasoning_result.get("reasoning_type"), 
+                                "complexity": reasoning_result.get("complexity"),
+                                "lora_adapter": lora_optimization.get("adapter"),
+                                "personality_optimized": lora_optimization.get("success", False)
+                            }
+                
+                # Handle reasoning errors with direct AI fallback
+                local_response = await self._try_local_ai(message, context, tone)
+                if local_response["success"]:
+                    logger.info(f"✅ Local AI fallback for user {user_id}")
+                    return local_response
+                
+                if self._openai_client:
+                    openai_response = await self._try_openai(message, context, tone)
+                    if openai_response["success"]:
+                        logger.info(f"✅ OpenAI fallback for user {user_id}")
+                        return openai_response
+                        
+            except Exception as e:
+                logger.error(f"Reasoning integration failed: {e}")
+                # Continue with direct AI fallback
+            
+            # Final fallback
+            logger.warning(f"All AI services failed for user {user_id}")
+            return {
+                "success": False,
+                "response": "I'm having trouble processing your message right now. Please try again in a moment.",
+                "source": "fallback"
+            }
     
     async def _try_local_ai(
         self, 
@@ -80,24 +163,37 @@ class AIService:
         context: Optional[List[Dict]] = None,
         tone: str = "friendly"
     ) -> Dict[str, Any]:
-        """Try local vLLM GPU inference"""
+        """Try local vLLM GPU inference with LoRA adapter support"""
         try:
             # Format message for local model
             formatted_messages = self._format_for_local_model(message, context, tone)
             
-            # Make request to local vLLM server
+            # Get current LoRA adapter for personality
+            current_adapter = await lora_service.get_current_adapter()
+            
+            # Make request to local vLLM server with LoRA support
             payload = {
-                "model": config.ai.local_model_name,
+                "model": "llama-3-8b",  # PRD specified model
                 "messages": formatted_messages,
                 "max_tokens": config.ai.max_tokens,
                 "temperature": config.ai.temperature,
                 "stream": False
             }
             
+            # Add LoRA adapter if available
+            if current_adapter:
+                payload["adapter_name"] = f"eva-{current_adapter}"
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer eva-lite-api-key"  # vLLM API key
+            }
+            
             response = await self.http_client.post(
-                f"{config.ai.vllm_base_url}/chat/completions",
+                f"{config.ai.vllm_base_url}/v1/chat/completions",
                 json=payload,
-                headers={"Content-Type": "application/json"}
+                headers=headers,
+                timeout=25.0  # Leave 5s buffer for 30s total timeout
             )
             
             if response.status_code == 200:

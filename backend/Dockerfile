@@ -1,43 +1,68 @@
-FROM python:3.11-slim
+# Eva Lite Production Dockerfile
+# Multi-stage build for optimized production image
 
-# Install system dependencies
+FROM python:3.11-slim as builder
+
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    cmake \
+    curl \
     git \
-    wget \
+    libffi-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip wheel && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Production stage
+FROM python:3.11-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
     libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Create app user for security
+RUN groupadd -r eva && useradd -r -g eva -d /app -s /bin/bash eva
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install whisper.cpp
-RUN git clone https://github.com/ggerganov/whisper.cpp.git /tmp/whisper.cpp && \
-    cd /tmp/whisper.cpp && \
-    cmake -B build && \
-    cmake --build build --config Release && \
-    cp build/bin/whisper-cli /usr/local/bin/whisper && \
-    cp models/download-ggml-model.sh /usr/local/bin/ && \
-    rm -rf /tmp/whisper.cpp
-
-# Download whisper model
-RUN wget -P /app/models/ https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
-
 # Copy application code
-COPY . .
+COPY --chown=eva:eva . .
 
-# Create necessary directories
-RUN mkdir -p /app/models /app/audio_cache /app/logs
+# Create required directories
+RUN mkdir -p /app/data/audio /app/data/models /app/logs && \
+    chown -R eva:eva /app
+
+# Switch to non-root user
+USER eva
+
+# Environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
 
 # Expose port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Default command (can be overridden)
+CMD ["python", "eva_webhook.py"]

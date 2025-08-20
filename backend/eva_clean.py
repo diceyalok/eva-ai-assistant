@@ -52,7 +52,12 @@ class EvaCleanBot:
             await ai_service.initialize()
             
             logger.info("🧠 Initializing memory service...")
-            await memory_service.initialize()
+            try:
+                await memory_service.initialize()
+                logger.info("✅ Memory service initialized")
+            except Exception as e:
+                logger.warning(f"⚠️ Memory service unavailable: {e}")
+                logger.info("🔄 Continuing without persistent memory (ChromaDB not running)")
             
             logger.info("🎵 Initializing voice service...")
             await voice_service.initialize()
